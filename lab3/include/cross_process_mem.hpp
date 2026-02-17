@@ -1,13 +1,13 @@
 #pragma once
 
-#include <string>
-#include <stdexcept>
+#include <string.h>
+#include <stdlib.h>
 
 #ifdef _WIN32
 #   include <windows.h>
-#	define MAP_NAME_PREFIX "Local\\"
-#	define INV_HANDLE (NULL)
-#	define CSEM        HANDLE
+#   define MAP_NAME_PREFIX "Local\\"
+#   define INV_HANDLE (NULL)
+#   define CSEM        HANDLE
 #else
 #   include <sys/mman.h>
 #   include <sys/stat.h>
@@ -16,207 +16,250 @@
 #   include <semaphore.h>
 #   define HANDLE          int
 #   define INV_HANDLE      (-1)
-#	define MAP_NAME_PREFIX  "/"
-#	define CSEM            sem_t*
+#   define MAP_NAME_PREFIX "/"
+#   define CSEM            sem_t*
 #endif
 
-namespace cpmem {
-    template <class T> class SharedMem {
-        private:
-            struct Header {
-                T data;
-                int ref_count;
-            };
+#define SEM_NAME_POSTFIX "_sem"
 
-            std::string mem_name_;
-            std::string sem_name_;
-            
-            #ifdef _WIN32
-                HANDLE fd_ = INV_HANDLE;
-                HANDLE sem_ = INV_HANDLE;
-            #else
-                int fd_ = INV_HANDLE;
-                sem_t* sem_ = SEM_FAILED;
-            #endif
-            
-            Header* mapped_mem_ = nullptr;
-
-            std::string BuildName(const char* base, const char* suffix = "") {
-                return MAP_NAME_PREFIX + std::string(base) + suffix;
-            }
-
+namespace cplib
+{
+    template <class T>
+    class SharedMem
+    {
         public:
-            SharedMem(const char* name, bool create_if_not_exists = true) 
-                : mem_name_(BuildName(name)), 
-                  sem_name_(BuildName(name, "_sem")) 
+            SharedMem(const char* name, bool create_if_not_exists = true)
+                : _fd(INV_HANDLE)
+                , _mem(NULL)
+                , _sem(NULL)
             {
-                if (!Open() && create_if_not_exists) {
-                    Create();
+                _fname = (char*)malloc(strlen(name) + strlen(MAP_NAME_PREFIX) + 1);
+                memcpy(_fname, MAP_NAME_PREFIX, strlen(MAP_NAME_PREFIX));
+                memcpy(_fname + strlen(MAP_NAME_PREFIX), name, strlen(name) + 1);
+                
+                _semname = (char*)malloc(strlen(_fname) + strlen(SEM_NAME_POSTFIX) + 1);
+                memcpy(_semname, _fname, strlen(_fname));
+                memcpy(_semname + strlen(_fname), SEM_NAME_POSTFIX, strlen(SEM_NAME_POSTFIX) + 1);
+
+                bool is_new = false;
+                bool ret = OpenMem(_fname, _semname);
+                
+                if (!ret && create_if_not_exists) {
+                    if (ret = CreateMem(_fname, _semname)) {
+                        is_new = true;
+                    }
                 }
                 
-                if (!IsValid()) {
-                    throw std::runtime_error("Не удалось создать или открыть память");
+                if (ret) {
+                    ret = MapMem();
                 }
                 
-                Map();
+                if (ret && is_new) {
+                    _mem->cnt = 0;
+                    _mem->str = T();
+                }
                 
-                Lock();
-                mapped_mem_->ref_count++;
-                Unlock();
-            }
-            
-            ~SharedMem() {
-                if (mapped_mem_) {
-                    Lock();
-                    bool last_user = (--mapped_mem_->ref_count == 0);
-                    Unlock();
-                    
-                    Unmap();
-                    Close();
-                    
-                    if (last_user) {
-                        #ifndef _WIN32
-                            shm_unlink(mem_name_.c_str());
-                            sem_unlink(sem_name_.c_str());
-                        #endif
+                if (ret) {
+                    LockSema();
+                    _mem->cnt++;
+                    UnlockSema();
+                } else {
+                    if (is_new) {
+                        DestroyMem();
+                    } else {
+                        CloseMem();
                     }
                 }
             }
 
-            void Close() {
-                #ifdef _WIN32
-                    if (fd_ != INV_HANDLE) CloseHandle(fd_);
-                    if (sem_ != INV_HANDLE) CloseHandle(sem_);
-                #else
-                    if (fd_ != INV_HANDLE) close(fd_);
-                    if (sem_ != SEM_FAILED) sem_close(sem_);
-                #endif
+            virtual ~SharedMem()
+            {
+                if (IsValid()) {
+                    int cnt = 0;
+                    
+                    LockSema();
+                    _mem->cnt--;
+                    cnt = _mem->cnt;
+                    UnlockSema();
+                    
+                    if (cnt <= 0) {
+                        DestroyMem();
+                    } else {
+                        CloseMem();
+                    }
+                }
                 
-                fd_ = INV_HANDLE;
-                #ifdef _WIN32
-                sem_ = INV_HANDLE;
-                #else
-                sem_ = SEM_FAILED;
-                #endif
+                free(_fname);
+                free(_semname);
             }
-            
-            bool IsValid() const {
-                #ifdef _WIN32
-                    return fd_ != INV_HANDLE && sem_ != INV_HANDLE && mapped_mem_;
-                #else
-                    return fd_ != INV_HANDLE && sem_ != SEM_FAILED && mapped_mem_;
-                #endif
+
+            bool IsValid()
+            {
+                return _fd != INV_HANDLE && _sem != NULL && _mem != NULL;
             }
-            
-            T* Data() { 
-                return IsValid() ? &mapped_mem_->data : nullptr; 
+
+            void Lock()
+            {
+                LockSema();
             }
-            
-            void Lock() {
-                #ifdef _WIN32
-                    WaitForSingleObject(sem_, INFINITE);
-                #else
-                    sem_wait(sem_);
-                #endif
+
+            T* Data()
+            {
+                if (!IsValid()) {
+                    return NULL;
+                }
+                return &_mem->str;
             }
-            
-            void Unlock() {
-                #ifdef _WIN32
-                    ReleaseSemaphore(sem_, 1, NULL);
-                #else
-                    sem_post(sem_);
-                #endif
+
+            void Unlock()
+            {
+                UnlockSema();
             }
 
         private:
-            bool Open() {
+            bool OpenMem(const char* mem_name, const char* sem_name)
+            {
                 #ifdef _WIN32
-                    fd_ = OpenFileMapping(FILE_MAP_WRITE, FALSE, mem_name_.c_str());
-                    if (fd_ != INV_HANDLE) {
-                        sem_ = OpenSemaphore(SEMAPHORE_ALL_ACCESS, FALSE, sem_name_.c_str());
+                    _fd = OpenFileMapping(FILE_MAP_WRITE, true, mem_name);
+                    if (_fd != INV_HANDLE) {
+                        _sem = OpenSemaphore(SEMAPHORE_ALL_ACCESS, false, sem_name);
                     }
                 #else
-                    fd_ = shm_open(mem_name_.c_str(), O_RDWR, 0644);
-                    if (fd_ != INV_HANDLE) {
-                        sem_ = sem_open(sem_name_.c_str(), 0);
-                    }
-                #endif
-                    return IsValid();
-            }
-            
-            bool Create() {
-                #ifdef _WIN32
-                    fd_ = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, 
-                                            PAGE_READWRITE, 0, sizeof(Header), mem_name_.c_str());
-                    if (fd_ != INV_HANDLE) {
-                        sem_ = CreateSemaphore(NULL, 1, 1, sem_name_.c_str());
-                    }
-                #else
-                    fd_ = shm_open(mem_name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
-                    if (fd_ != INV_HANDLE) {
-                        ftruncate(fd_, sizeof(Header));
-                        sem_ = sem_open(sem_name_.c_str(), O_CREAT | O_EXCL, 0644, 1);
-                    }
-                #endif
-                    if (IsValid()) {
-                        Map();
-                        if (mapped_mem_) {
-                            mapped_mem_->ref_count = 0;
-                            mapped_mem_->data = T();
+                    _fd = shm_open(mem_name, O_RDWR, 0644);
+                    if (_fd != INV_HANDLE) {
+                        _sem = sem_open(sem_name, 0);
+                        if (_sem == SEM_FAILED) {
+                            _sem = NULL;
                         }
                     }
-                
-                return IsValid();
-            }
-            
-            void Map() {
-                #ifdef _WIN32
-                    mapped_mem_ = reinterpret_cast<Header*>(
-                        MapViewOfFile(fd_, FILE_MAP_WRITE, 0, 0, sizeof(Header)));
-                #else
-                    void* ptr = mmap(NULL, sizeof(Header), PROT_READ | PROT_WRITE, 
-                                    MAP_SHARED, fd_, 0);
-                    mapped_mem_ = (ptr != MAP_FAILED) ? reinterpret_cast<Header*>(ptr) : nullptr;
                 #endif
+
+                return (_fd != INV_HANDLE && _sem != NULL);
             }
-            
-            void Unmap() {
-                if (!mapped_mem_) return;
+
+            bool CreateMem(const char* mem_name, const char* sem_name)
+            {
+                #ifdef _WIN32
+                    _fd = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 
+                                            sizeof(shmem_contents), mem_name);
+                    if (_fd != INV_HANDLE) {
+                        _sem = CreateSemaphore(NULL, 0, 1, sem_name);
+                    }
+                #else
+                    _fd = shm_open(mem_name, O_CREAT | O_EXCL | O_RDWR, 0644);
+                    if (_fd != INV_HANDLE) {
+                        ftruncate(_fd, sizeof(shmem_contents));
+                        _sem = sem_open(sem_name, O_CREAT | O_EXCL, 0644, 1);
+                        if (_sem == SEM_FAILED) {
+                            _sem = NULL;
+                        }
+                    }
+                #endif
+
+                return (_fd != INV_HANDLE && _sem != NULL);
+            }
+
+            bool MapMem()
+            {
+                if (_fd == INV_HANDLE) {
+                    return false;
+                }
                 
                 #ifdef _WIN32
-                    UnmapViewOfFile(mapped_mem_);
+                    _mem = reinterpret_cast<shmem_contents*>(
+                        MapViewOfFile(_fd, FILE_MAP_WRITE, 0, 0, sizeof(struct shmem_contents)));
                 #else
-                    munmap(mapped_mem_, sizeof(Header));
+                    void* res = mmap(NULL, sizeof(struct shmem_contents), 
+                                    PROT_WRITE | PROT_READ, MAP_SHARED, _fd, 0);
+                    if (res == MAP_FAILED) {
+                        _mem = NULL;
+                    } else {
+                        _mem = reinterpret_cast<shmem_contents*>(res);
+                    }
                 #endif
-                    mapped_mem_ = nullptr;
+
+                return (_mem != NULL);
             }
-            
-            void Close() {
-                Unmap();
+
+            bool UnMapMem()
+            {
+                if (_mem == NULL) {
+                    return false;
+                }
                 
                 #ifdef _WIN32
-                    if (fd_ != INV_HANDLE) CloseHandle(fd_);
-                    if (sem_ != INV_HANDLE) CloseHandle(sem_);
+                    UnmapViewOfFile(_mem);
                 #else
-                    if (fd_ != INV_HANDLE) close(fd_);
-                    if (sem_ != SEM_FAILED) sem_close(sem_);
+                    munmap(_mem, sizeof(struct shmem_contents));
                 #endif
-                
-                fd_ = INV_HANDLE;
-                #ifdef _WIN32
-                sem_ = INV_HANDLE;
-                #else
-                sem_ = SEM_FAILED;
-                #endif
+
+                _mem = NULL;
+                return true;
             }
-            
-            void Destroy() {
-                Close();
+
+            void CloseMem()
+            {
+                // Отключим память
+                UnMapMem();
+                
+                if (_fd != INV_HANDLE) {
+                    #ifdef _WIN32
+                        CloseHandle(_fd);
+                    #else
+                        close(_fd);
+                    #endif
+
+                    _fd = INV_HANDLE;
+                }
+                
+                if (_sem != NULL) {
+                    #ifdef _WIN32
+                        CloseHandle(_sem);
+                    #else
+                        sem_close(_sem);
+                    #endif
+
+                    _sem = NULL;
+                }
+            }
+
+            void DestroyMem()
+            {
+                CloseMem();
                 
                 #ifndef _WIN32
-                    shm_unlink(mem_name_.c_str());
-                    sem_unlink(sem_name_.c_str());
+                    shm_unlink(_fname);
+                    sem_unlink(_semname);
                 #endif
             }
+
+            void LockSema()
+            {
+                #ifdef _WIN32
+                    ReleaseSemaphore(_sem, 1, NULL);
+                #else
+                    sem_post(_sem);
+                #endif
+            }
+
+            void UnlockSema()
+            {
+                #ifdef _WIN32
+                    WaitForSingleObject(_sem, 0);
+                #else
+                    sem_wait(_sem);
+                #endif
+            }
+
+            struct shmem_contents
+            {
+                T   str;
+                int cnt;
+            } *_mem;
+
+            CSEM    _sem;
+            HANDLE  _fd;
+            char*   _fname;
+            char*   _semname;
     };
-};
+}

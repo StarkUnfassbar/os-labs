@@ -2,7 +2,7 @@
 echo === Сборка проекта ===
 
 REM обновление кода
-@REM git pull
+git pull
 
 REM Переход в директорию проекта
 set PROJECT_DIR=%~dp0

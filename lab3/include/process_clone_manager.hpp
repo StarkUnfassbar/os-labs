@@ -70,12 +70,11 @@ class CloneLogger {
         void loggingThread();
         void cloningThread();
         void processUserInput();
-        bool is_process_running(int pid);
         int spawn_clone(int clone_num);
         
         std::string log_file_;
         std::ofstream log_stream_;
-        cpmem::SharedMem<CounterData> shared_mem_;
+        cplib::SharedMem<CounterData> shared_mem_;
         std::atomic<bool> running_;
         std::thread timer_thread_;
         std::thread logging_thread_;

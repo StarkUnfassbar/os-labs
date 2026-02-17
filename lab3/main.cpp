@@ -6,7 +6,7 @@
 #include "process_clone_manager.hpp"
 
 #define SHARED_MEM_NAME "mylab_counter"
-#define LOG_FILE "lab.log"
+#define LOG_FILE "log.log"
 
 #ifdef _WIN32
 #   include <windows.h>
@@ -16,6 +16,9 @@
 #   include <signal.h>
 #   include <sys/types.h>
 #endif
+
+#include <exception>
+#include <cstdlib>
 
 using namespace std::chrono_literals;
 
@@ -73,7 +76,7 @@ void CloneLogger::timerThread() {
         shared_mem_.Lock();
 
         CounterData* data = shared_mem_.Data();
-        if(data){ data -> counter++; }
+        if(data){ data->counter++; }
 
         shared_mem_.Unlock();
     }
@@ -86,12 +89,31 @@ void CloneLogger::loggingThread() {
         shared_mem_.Lock();
 
         CounterData* data = shared_mem_.Data();
-        if(data && data -> master_pid == current_pid_){
-            write_log("counter " + std::to_string(data -> counter));
+        if(data && data->master_pid == current_pid_){
+            write_log("counter " + std::to_string(data->counter));
         }
 
         shared_mem_.Unlock();
     }
+}
+
+bool is_process_running(int pid) {
+    if (pid <= 0) return false;
+    
+    #ifdef _WIN32
+        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (process) {
+            DWORD exit_code;
+            if (GetExitCodeProcess(process, &exit_code)) {
+                CloseHandle(process);
+                return exit_code == STILL_ACTIVE;
+            }
+            CloseHandle(process);
+        }
+        return false;
+    #else
+        return kill(pid, 0) == 0;
+    #endif
 }
 
 void CloneLogger::cloningThread() {
@@ -150,25 +172,6 @@ void CloneLogger::cloningThread() {
     }
 }
 
-bool CloneLogger::is_process_running(int pid) {
-    if (pid <= 0) return false;
-    
-    #ifdef _WIN32
-        HANDLE process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-        if (process) {
-            DWORD exit_code;
-            if (GetExitCodeProcess(process, &exit_code)) {
-                CloseHandle(process);
-                return exit_code == STILL_ACTIVE;
-            }
-            CloseHandle(process);
-        }
-        return false;
-    #else
-        return kill(pid, 0) == 0;
-    #endif
-}
-
 void CloneLogger::processUserInput() {
     std::string cmd, arg;
 
@@ -223,7 +226,7 @@ int CloneLogger::spawn_clone(int clone_num) {
 
 
 void run_clone(int clone_num){
-    cpmem::SharedMem<CounterData> shared_mem(SHARED_MEM_NAME);
+    cplib::SharedMem<CounterData> shared_mem(SHARED_MEM_NAME);
     if (!shared_mem.IsValid()) {
         std::cerr << "Не удалось получить доступ к общей памяти в копии!" << std::endl;
         return;
